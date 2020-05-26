@@ -33,13 +33,13 @@ namespace Unity.Physics.Extensions
 
         public struct RayResult
         {
-            public BlockStream PixelData;
+            public NativeStream PixelData;
         }
 
         public RayResult AddRequest(RayRequest req)
         {
             int numWorkItems = 5;
-            RayResult res = new RayResult { PixelData = new BlockStream(numWorkItems, 0xa1070b6d) };
+            var res = new RayResult { PixelData = new NativeStream(numWorkItems, Allocator.TempJob) };
             m_Requests.Add(req);
             m_Results.Add(res);
             return res;
@@ -53,7 +53,7 @@ namespace Unity.Physics.Extensions
         [BurstCompile]
         protected struct RaycastJob : IJobParallelFor
         {
-            public BlockStream.Writer Results;
+            public NativeStream.Writer Results;
             public RayRequest Request;
             [ReadOnly] public CollisionWorld World;
             public int NumDynamicBodies;
@@ -64,7 +64,7 @@ namespace Unity.Physics.Extensions
                 int numRows = (Request.ImageResolution + Results.ForEachCount - 1) / Results.ForEachCount;
 
                 const float sphereRadius = 0.005f;
-                BlobAssetReference<Collider> sphere;
+                BlobAssetReference<Collider> sphere = default;
                 if (Request.CastSphere)
                 {
                     sphere = SphereCollider.Create(new SphereGeometry
@@ -83,7 +83,7 @@ namespace Unity.Physics.Extensions
 
                         float3 targetImagePlane = Request.ImageCenter + Request.Up * Request.PlaneHalfExtents * yFrac + Request.Right * Request.PlaneHalfExtents * xFrac;
                         float3 rayDir = Request.RayLength * (Request.PinHole - targetImagePlane);
-                        
+
                         RaycastHit hit;
                         bool hasHit;
                         if (Request.CastSphere)
@@ -131,7 +131,7 @@ namespace Unity.Physics.Extensions
                             // Lighten alternate keys
                             if (Request.AlternateKeys && !hit.ColliderKey.Equals(ColliderKey.Empty))
                             {
-                                Collider* collider = World.Bodies[hit.RigidBodyIndex].Collider;
+                                var collider = (Collider*)World.Bodies[hit.RigidBodyIndex].Collider.GetUnsafePtr();
                                 hit.ColliderKey.PopSubKey(collider->NumColliderKeyBits, out uint key);
                                 if (key % 2 == 0)
                                 {
@@ -195,7 +195,7 @@ namespace Unity.Physics.Extensions
             m_Requests = new List<RayRequest>();
             m_Results = new List<RayResult>();
         }
-        
+
         protected override JobHandle OnUpdate(JobHandle inputDeps)
         {
             if (m_Requests == null || m_Requests.Count == 0)
@@ -210,7 +210,7 @@ namespace Unity.Physics.Extensions
             {
                 JobHandle rcj = new RaycastJob
                 {
-                    Results = m_Results[0].PixelData,
+                    Results = m_Results[0].PixelData.AsWriter(),
                     Request = m_Requests[0],
                     World = m_BuildPhysicsWorldSystem.PhysicsWorld.CollisionWorld,
                     NumDynamicBodies = m_BuildPhysicsWorldSystem.PhysicsWorld.NumDynamicBodies

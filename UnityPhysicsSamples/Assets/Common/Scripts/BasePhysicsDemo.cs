@@ -1,9 +1,11 @@
-﻿using System;
+using System;
+using System.Collections;
 using System.Collections.Generic;
-using Unity.Physics;
-using Unity.Physics.Extensions;
+using System.Reflection;
 using Unity.Entities;
 using Unity.Mathematics;
+using Unity.Physics;
+using Unity.Physics.Extensions;
 using Unity.Rendering;
 using Unity.Transforms;
 using UnityEngine;
@@ -16,16 +18,18 @@ using Mesh = UnityEngine.Mesh;
 /// </summary>
 public class BasePhysicsDemo : MonoBehaviour
 {
-    public static World DefaultWorld
+    public static World DefaultWorld => World.DefaultGameObjectInjectionWorld;
+
+    public static void ResetDefaultWorld()
     {
-        get
+        DefaultWorld.EntityManager.CompleteAllJobs();
+        foreach(var system in DefaultWorld.Systems)
         {
-#if UNITY_ENTITIES_0_2_0_OR_NEWER
-            return World.DefaultGameObjectInjectionWorld;
-#else
-            return World.Active;
-#endif
+            system.Enabled = false;
         }
+
+        DefaultWorld.Dispose();
+        DefaultWorldInitialization.Initialize("Default World", false);
     }
 
     protected Entity stepper;
@@ -69,6 +73,28 @@ public class BasePhysicsDemo : MonoBehaviour
         //staticMaterial = (Material)Resources.Load("Materials/PhysicsStaticMaterial");
     }
 
+#if !UNITY_EDITOR
+    void OnEnable()
+    {
+        Application.logMessageReceivedThreaded += HandleLogEntry;
+    }
+
+    void HandleLogEntry(string logEntry, string stackTrace, LogType logType)
+    {
+        if (logType == LogType.Exception)
+        {
+            // Log exception and exit with non-zero error code
+            UnityEngine.Debug.Log($"Caught an exception, exiting... \n {logEntry} \n {stackTrace}");
+            Application.Quit(1);
+        }
+    }
+
+    void OnDisable()
+    {
+        Application.logMessageReceivedThreaded -= HandleLogEntry;
+    }
+#endif
+
     protected virtual void Start()
     {
         init(new float3(0, -9.81f, 0));
@@ -78,7 +104,19 @@ public class BasePhysicsDemo : MonoBehaviour
     // Object creation
     //
 
-    private Entity CreateBody(float3 position, quaternion orientation, BlobAssetReference<Collider> collider,
+    // TODO: add proper utility APIs for converting Collider into buffers usable for UnityEngine.Mesh and for drawing lines
+    static readonly Type k_DrawComponent = typeof(Unity.Physics.Authoring.DisplayBodyColliders)
+        .GetNestedType("DrawComponent", BindingFlags.NonPublic);
+
+    static readonly MethodInfo k_DrawComponent_BuildDebugDisplayMesh = k_DrawComponent
+        .GetMethod("BuildDebugDisplayMesh", BindingFlags.Static | BindingFlags.NonPublic, null, new[] { typeof(BlobAssetReference<Collider>) }, null);
+
+    static readonly Type k_DisplayResult = k_DrawComponent.GetNestedType("DisplayResult");
+
+    static readonly FieldInfo k_DisplayResultsMesh = k_DisplayResult.GetField("Mesh");
+    static readonly PropertyInfo k_DisplayResultsTransform = k_DisplayResult.GetProperty("Transform");
+
+    Entity CreateBody(float3 position, quaternion orientation, BlobAssetReference<Collider> collider,
         float3 linearVelocity, float3 angularVelocity, float mass, bool isDynamic)
     {
         var entityManager = DefaultWorld.EntityManager;
@@ -92,30 +130,29 @@ public class BasePhysicsDemo : MonoBehaviour
         var colliderComponent = new PhysicsCollider { Value = collider };
         entityManager.AddComponentData(entity, colliderComponent);
 
-        Mesh mesh = new Mesh();
-#pragma warning disable 618
-        List<Unity.Physics.Authoring.DisplayBodyColliders.DrawComponent.DisplayResult> meshes;
-        unsafe { meshes = Unity.Physics.Authoring.DisplayBodyColliders.DrawComponent.BuildDebugDisplayMesh(colliderComponent.ColliderPtr); }
-#pragma warning restore 618
-        CombineInstance[] instances = new CombineInstance[meshes.Count];
-        int numVertices = 0;
-        for (int i = 0; i < meshes.Count; i++)
+        var mesh = new Mesh();
+        var instances = new List<CombineInstance>(8);
+        var numVertices = 0;
+        foreach (var displayResult in (IEnumerable)k_DrawComponent_BuildDebugDisplayMesh.Invoke(null, new object[] { collider }))
         {
-            instances[i] = new CombineInstance
+            var instance = new CombineInstance
             {
-                mesh = meshes[i].Mesh,
-                transform = Matrix4x4.TRS(meshes[i].Position, meshes[i].Orientation, meshes[i].Scale)
+                mesh = k_DisplayResultsMesh.GetValue(displayResult) as Mesh,
+                transform = (float4x4)k_DisplayResultsTransform.GetValue(displayResult)
             };
-            numVertices += meshes[i].Mesh.vertexCount;
+            instances.Add(instance);
+            numVertices += mesh.vertexCount;
         }
         mesh.indexFormat = numVertices > UInt16.MaxValue ? UnityEngine.Rendering.IndexFormat.UInt32 : UnityEngine.Rendering.IndexFormat.UInt16;
-        mesh.CombineMeshes(instances);
+        mesh.CombineMeshes(instances.ToArray());
+        mesh.RecalculateBounds();
 
         entityManager.AddSharedComponentData(entity, new RenderMesh
         {
             mesh = mesh,
             material = isDynamic ? dynamicMaterial : staticMaterial
         });
+        entityManager.AddComponentData(entity, new RenderBounds { Value = mesh.bounds.ToAABB() });
 
         if (isDynamic)
         {
